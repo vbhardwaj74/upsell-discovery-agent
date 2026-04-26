@@ -1,0 +1,14 @@
+# Secrets — NEVER commit these
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.python-version
+
+# OS
+.DS_Store
+
+# Phoenix local data
+.phoenix/
