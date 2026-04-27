@@ -26,7 +26,7 @@ load_dotenv()
 # Page config + styles
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Upsell Discovery Agent",
+    page_title="Northstar - Disovery Agent",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -164,7 +164,7 @@ with st.sidebar:
 st.markdown(
     """
     <div style='display:flex; align-items:baseline; gap:12px;'>
-      <h1 style='margin:0; font-family: Georgia, serif;'>Upsell Discovery Agent</h1>
+      <h1 style='margin:0; font-family: Georgia, serif;'>Northstar 💫</h1>
       <span class="badge badge-accent">LIVE</span>
     </div>
     <p style='color:#64748B; margin-top:4px;'>
