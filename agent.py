@@ -358,26 +358,226 @@ def _build_billing(account_id: str) -> dict:
 BILLING = {aid: _build_billing(aid) for aid in ACCOUNTS}
 
 
+# --- Contacts (org chart) ---------------------------------------------------
+# Each account has 4 stakeholders modeling the typical enterprise SaaS buying
+# committee: Champion (day-to-day user, drives adoption), Economic Buyer
+# (signs the PO), Decision Maker (technical sponsor), and Influencer.
+# In production this would come from Salesforce contacts + Gong/Outreach
+# enrichment.
+
+# Deterministic name pool — same seed → same names per account
+_FIRST_NAMES_F = ["Sarah", "Priya", "Maya", "Elena", "Jordan", "Aisha", "Nina", "Riley"]
+_FIRST_NAMES_M = ["Marcus", "Diego", "Kenji", "Andre", "Wesley", "Theo", "Raj", "Liam"]
+_LAST_NAMES = [
+    "Chen", "Patel", "Williams", "Garcia", "Kim", "Rodriguez", "Singh",
+    "Nguyen", "Khan", "Morales", "Park", "O'Connor", "Brennan", "Okafor",
+]
+
+_ROLE_TEMPLATES = {
+    "champion": [
+        "Director of {dept}", "Sr. Manager, {dept}", "Head of {dept}",
+        "{dept} Operations Lead", "Principal {dept} Analyst",
+    ],
+    "economic_buyer": [
+        "VP of {dept}", "SVP {dept}", "Chief {dept_short} Officer",
+    ],
+    "decision_maker": [
+        "VP of Engineering", "Head of Platform", "Director of Architecture",
+        "Sr. Director, IT", "VP of Information Security",
+    ],
+    "influencer": [
+        "Sr. {dept} Engineer", "Staff {dept} Analyst",
+        "{dept} Program Manager", "Sr. Product Manager, {dept}",
+    ],
+}
+
+_DEPT_BY_INDUSTRY = {
+    "Financial Services":    ("Risk Analytics",     "Risk"),
+    "Manufacturing":         ("Operations",         "Operations"),
+    "Technology":            ("Engineering",        "Technology"),
+    "Conglomerate":          ("Strategic Ops",      "Operations"),
+    "Distribution":          ("Logistics",          "Operations"),
+    "Biotech":               ("Research IT",        "Technology"),
+    "Research":              ("Data Science",       "Data"),
+    "Consumer Goods":        ("Brand Analytics",    "Marketing"),
+    "Pharmaceuticals":       ("Compliance",         "Compliance"),
+    "Logistics":             ("Fleet Operations",   "Operations"),
+    "Defense":               ("Mission Systems",    "Technology"),
+    "Entertainment":         ("Production Tech",    "Technology"),
+    "Real Estate":           ("Portfolio Analytics","Operations"),
+    "Trading":               ("Quantitative Ops",   "Operations"),
+    "Consulting":            ("Practice Operations","Operations"),
+    "Food & Beverage":       ("Supply Chain",       "Operations"),
+    "Import/Export":         ("Trade Operations",   "Operations"),
+}
+
+
+def _build_contacts(account_id: str) -> dict:
+    """Generate a 4-person buying committee for an account.
+
+    Uses a deterministic hash-based picker so the same account always gets
+    the same contacts run-to-run (important for demo reproducibility).
+    """
+    acct = ACCOUNTS[account_id]
+    industry = acct["industry"]
+    dept, dept_short = _DEPT_BY_INDUSTRY.get(industry, ("Operations", "Operations"))
+
+    # Stable seed from account_id
+    seed = sum(ord(c) for c in account_id)
+
+    def pick(pool, offset):
+        return pool[(seed + offset) % len(pool)]
+
+    # Mix gendered first-name pools for variety; offset spreads picks across pools
+    def make_name(offset):
+        first_pool = _FIRST_NAMES_F if (seed + offset) % 2 == 0 else _FIRST_NAMES_M
+        first = pick(first_pool, offset)
+        last = pick(_LAST_NAMES, offset + 3)
+        return f"{first} {last}"
+
+    def make_role(role_key, offset):
+        template = pick(_ROLE_TEMPLATES[role_key], offset)
+        return template.format(dept=dept, dept_short=dept_short)
+
+    # Build a clean, plausible email domain from the company name.
+    # Strip "Corp", "Industries", etc., to get a recognizable slug.
+    name_words = acct["name"].lower().split()
+    SUFFIXES_TO_DROP = {"corp", "corporation", "industries", "company",
+                        "holdings", "systems", "logistics", "trading",
+                        "solutions", "research", "pharmaceuticals",
+                        "capital", "worldwide"}
+    primary = next((w for w in name_words if w not in SUFFIXES_TO_DROP), name_words[0])
+    domain = f"{primary}.com"
+
+    def make_email(name):
+        first, last = name.lower().split()[0], name.lower().split()[-1]
+        return f"{first[0]}.{last}@{domain}"
+
+    contacts = []
+    for i, role_key in enumerate(["champion", "economic_buyer", "decision_maker", "influencer"]):
+        name = make_name(i * 7)
+        role = make_role(role_key, i * 5)
+        contacts.append({
+            "name": name,
+            "role": role,
+            "buying_influence": role_key,
+            "email": make_email(name),
+            "linkedin": f"https://linkedin.com/in/{name.lower().replace(' ', '-')}",
+        })
+
+    return {"contacts": contacts}
+
+
+CONTACTS = {aid: _build_contacts(aid) for aid in ACCOUNTS}
+
+
+# --- Meeting log (last touchpoints) -----------------------------------------
+# Each account has 2-3 recent touchpoints with metadata + a pseudo-link to a
+# meeting recording (Gong-style) or notes doc. The agent uses days-since-last-
+# meeting to flag re-engagement risk.
+#
+# In production this would integrate with Gong/Chorus + Calendar + Salesforce
+# Activities.
+
+# Days-ago anchor: bigger numbers = more stale relationship
+# (matches our renewal/health archetypes)
+_MEETING_PROFILES = {
+    # Healthy + recently engaged accounts — fresh meetings
+    "fresh":      {"days_ago": [7, 21, 45]},
+    # Standard cadence — last meeting was a few weeks back
+    "standard":   {"days_ago": [18, 42, 75]},
+    # At-risk / dormant — last touch was a while ago, gaps in cadence
+    "stale":      {"days_ago": [62, 110]},
+    # Very dormant — major retention red flag
+    "very_stale": {"days_ago": [95]},
+}
+
+_MEETING_TYPES = ["QBR", "Check-in", "Discovery", "Exec sync", "Training", "Renewal call"]
+
+
+def _profile_for(account_id: str) -> str:
+    """Pick a meeting cadence profile based on account health/trend."""
+    acct = ACCOUNTS[account_id]
+    usage = USAGE[account_id]
+    health = acct["health_score"]
+    trend = usage["trend_30d"]
+    is_declining = trend.startswith("-")
+
+    if health < 55 or (is_declining and health < 70):
+        return "very_stale"
+    if health < 70 or is_declining:
+        return "stale"
+    if health >= 85:
+        return "fresh"
+    return "standard"
+
+
+def _build_meetings(account_id: str) -> dict:
+    """Generate a meeting log for an account based on its health profile."""
+    profile = _profile_for(account_id)
+    days_ago_list = _MEETING_PROFILES[profile]["days_ago"]
+    contacts = CONTACTS[account_id]["contacts"]
+
+    seed = sum(ord(c) for c in account_id)
+
+    meetings = []
+    for i, days_ago in enumerate(days_ago_list):
+        meeting_type = _MEETING_TYPES[(seed + i * 3) % len(_MEETING_TYPES)]
+        # Most-recent meeting is at index 0
+        # Champion attends every meeting, others rotate based on type
+        attendees = [contacts[0]["name"]]  # champion always
+        if meeting_type in ("QBR", "Exec sync", "Renewal call"):
+            attendees.append(contacts[1]["name"])  # economic buyer
+        if meeting_type in ("QBR", "Discovery", "Renewal call"):
+            attendees.append(contacts[2]["name"])  # decision maker
+        if meeting_type in ("Training", "Discovery", "Check-in"):
+            attendees.append(contacts[3]["name"])  # influencer
+
+        meetings.append({
+            "type": meeting_type,
+            "days_ago": days_ago,
+            "attendees": attendees,
+            "gong_link": f"https://app.gong.io/call/{account_id.lower()}-{i}",
+            "notes_link": f"https://app.gong.io/call/{account_id.lower()}-{i}/notes",
+        })
+
+    return {
+        "meetings": meetings,
+        "days_since_last_meeting": days_ago_list[0],
+        "cadence_profile": profile,
+    }
+
+
+MEETINGS = {aid: _build_meetings(aid) for aid in ACCOUNTS}
+
+
 # --- Tools ------------------------------------------------------------------
 
 @tool
 def get_account_overview(account_id: str) -> dict:
-    """Pull a customer's CRM record: name, tier, ARR, seats, renewal date, health score.
-    Use this first when a CSM asks about an account."""
+    """Pull a customer's CRM record: name, tier, ARR, seats, renewal date, health score,
+    plus the 4-person buying committee (champion, economic buyer, decision maker, influencer)
+    with their roles, emails, and LinkedIn profiles. Use this first when a CSM asks about
+    an account — the contact info is critical for any outreach you draft later."""
     record = ACCOUNTS.get(account_id.upper())
     if not record:
         return {"error": f"Account {account_id} not found. Available accounts: {', '.join(sorted(ACCOUNTS.keys()))}"}
-    return {"account_id": account_id.upper(), **record}
+    contacts = CONTACTS.get(account_id.upper(), {})
+    return {"account_id": account_id.upper(), **record, **contacts}
 
 
 @tool
 def get_product_usage(account_id: str) -> dict:
-    """Fetch product telemetry: active seats, license utilization, feature adoption,
-    usage trend. Use this to spot over-utilization or under-adopted premium features."""
+    """Fetch product telemetry plus recent meeting history: active seats, license utilization,
+    feature adoption, usage trend, support tickets, last 2-3 touchpoints with attendees and
+    pseudo-links to Gong recordings. Use this to spot expansion signals AND to gauge
+    relationship health — if days_since_last_meeting is over 60, flag re-engagement before
+    pushing more product."""
     usage = USAGE.get(account_id.upper())
     if not usage:
         return {"error": f"No usage data for {account_id}."}
-    return {"account_id": account_id.upper(), **usage}
+    meetings = MEETINGS.get(account_id.upper(), {})
+    return {"account_id": account_id.upper(), **usage, **meetings}
 
 
 @tool
@@ -446,15 +646,22 @@ def draft_outreach_email(
     expansion_summary: str,
     annual_uplift: int,
 ) -> dict:
-    """Draft a tailored outreach email to the customer's economic buyer based on the
-    expansion thesis you've built. Use this as the FINAL step once you have a
-    quantified opportunity."""
+    """Draft a tailored outreach email to the customer's champion based on the
+    expansion thesis you've built. Automatically uses the champion's first name
+    from the org chart. Use this as the FINAL step once you have a quantified
+    opportunity."""
     record = ACCOUNTS.get(account_id.upper(), {})
     name = record.get("name", account_id)
 
+    # Pull champion (first contact) for the salutation
+    contacts = CONTACTS.get(account_id.upper(), {}).get("contacts", [])
+    champion = contacts[0] if contacts else None
+    champion_first = champion["name"].split()[0] if champion else "there"
+    to_email = champion["email"] if champion else None
+
     subject = f"Quick thought on {name}'s {record.get('tier', '').lower()} footprint"
     body = (
-        f"Hi {{first_name}},\n\n"
+        f"Hi {champion_first},\n\n"
         f"Reviewing {name}'s usage trends ahead of our next QBR and wanted to flag "
         f"something I think your team will want visibility into.\n\n"
         f"{expansion_summary}\n\n"
@@ -463,7 +670,13 @@ def draft_outreach_email(
         f"Open to a 20-min walkthrough next week? Happy to bring product on the call.\n\n"
         f"Best,\nVishaal"
     )
-    return {"account_id": account_id.upper(), "subject": subject, "body": body}
+    return {
+        "account_id": account_id.upper(),
+        "to": to_email,
+        "to_name": champion["name"] if champion else None,
+        "subject": subject,
+        "body": body,
+    }
 
 
 # --- Build the agent --------------------------------------------------------
@@ -481,21 +694,27 @@ SYSTEM_PROMPT = """You are an Upsell Discovery copilot for an Enterprise Custome
 Your job: take an account ID, investigate it, and return a quantified expansion thesis.
 
 Workflow:
-1. Pull the account overview to understand context (tier, ARR, renewal timing, health).
+1. Pull the account overview to understand context (tier, ARR, renewal timing, health,
+   plus the buying committee — champion, economic buyer, decision maker, influencer).
 2. Pull product usage to find expansion signals — over-utilization, under-adopted premium
-   features, strong growth trends. Flag retention risk if health is low or trend is negative.
+   features, strong growth trends. This call also returns last meeting history and days
+   since last touchpoint.
 3. Pull billing to see current SKUs and what add-ons are available.
 4. Use calculate_expansion_opportunity to quantify the opportunity in dollars.
-5. Draft an outreach email tying it together.
+5. Draft an outreach email tying it together. The email is auto-addressed to the champion.
 
 Special cases:
 - If health score is below 65 OR trend is negative, lead with retention risk before
   recommending expansion. Don't push more product on an at-risk account.
 - If utilization is over 110%, prioritize a seat true-up — it's the easiest close.
 - If a premium SKU has under 10% adoption, that's a recovery play, not an upsell.
+- If days_since_last_meeting is over 60, flag re-engagement before drafting any
+  expansion outreach. A cold relationship can't be warmed by a sales pitch.
 
-Be concise in your reasoning. Always end with a quantified recommendation:
-the SKU(s) to push, the seat count, the dollar uplift, and the renewal-timing play.
+Always reference specific stakeholders by role and name when you have them. Be concise
+in your reasoning. Always end with a quantified recommendation: the SKU(s) to push,
+the seat count, the dollar uplift, the renewal-timing play, and which contact in the
+buying committee should drive the conversation.
 """
 
 

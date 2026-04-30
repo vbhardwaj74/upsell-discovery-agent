@@ -21,7 +21,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 # Pull in the agent and its mock data from agent.py
-from agent import build_agent, ACCOUNTS, USAGE
+from agent import build_agent, ACCOUNTS, USAGE, CONTACTS, MEETINGS
 
 load_dotenv()
 
@@ -236,6 +236,100 @@ with st.sidebar:
 
     st.caption(f"Renewal: **{acct['renewal_date']}**")
     st.caption(f"Industry: {acct['industry']}")
+
+    # --- Org chart card -----------------------------------------------------
+    contacts = CONTACTS[account_id]["contacts"]
+    st.markdown("---")
+    st.markdown("##### 👥 Buying Committee")
+
+    # Map raw influence keys to display labels with colored badges
+    INFLUENCE_BADGE = {
+        "champion":       ('<span class="badge badge-good">CHAMPION</span>',       "💚"),
+        "economic_buyer": ('<span class="badge badge-accent">ECON. BUYER</span>',  "💰"),
+        "decision_maker": ('<span class="badge badge-warn">DECISION MAKER</span>', "🎯"),
+        "influencer":     ('<span class="badge badge-warn">INFLUENCER</span>',     "📣"),
+    }
+
+    for c in contacts:
+        badge_html, emoji = INFLUENCE_BADGE.get(c["buying_influence"], ("", ""))
+        st.markdown(
+            f"""
+            <div style='padding: 6px 0; border-bottom: 1px solid #F1F5F9;'>
+              <div style='font-size: 13px; font-weight: 600; color: #0F172A;'>
+                {emoji} {c['name']}
+              </div>
+              <div style='font-size: 11px; color: #64748B; margin: 1px 0;'>
+                {c['role']}
+              </div>
+              <div style='margin: 3px 0;'>{badge_html}</div>
+              <div style='font-size: 10px; color: #94A3B8; font-family: monospace;'>
+                {c['email']}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # --- Last touchpoint card -----------------------------------------------
+    meetings = MEETINGS[account_id]
+    days_ago = meetings["days_since_last_meeting"]
+    cadence = meetings["cadence_profile"]
+
+    # Color-code based on cadence freshness
+    if cadence == "fresh":
+        cadence_badge = '<span class="badge badge-good">RECENT</span>'
+        cadence_color = "#10B981"
+    elif cadence == "standard":
+        cadence_badge = '<span class="badge badge-warn">STANDARD</span>'
+        cadence_color = "#F59E0B"
+    else:  # stale or very_stale
+        cadence_badge = '<span class="badge badge-bad">STALE</span>'
+        cadence_color = "#EF4444"
+
+    st.markdown("---")
+    st.markdown("##### 📅 Last Touchpoint")
+    st.markdown(
+        f"<div style='margin: 4px 0'>{cadence_badge} "
+        f"<span style='font-size: 11px; color: #64748B;'>{days_ago} days ago</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    # Show the most recent meeting (others available on click)
+    latest = meetings["meetings"][0]
+    st.markdown(
+        f"""
+        <div style='padding: 8px 10px; background: #F8FAFC; border-left: 3px solid {cadence_color};
+                    border-radius: 4px; margin: 6px 0;'>
+          <div style='font-size: 12px; font-weight: 600; color: #0F172A;'>
+            {latest['type']}
+          </div>
+          <div style='font-size: 10px; color: #64748B; margin: 2px 0;'>
+            {len(latest['attendees'])} attendees: {', '.join(latest['attendees'])}
+          </div>
+          <a href="{latest['gong_link']}" target="_blank"
+             style='font-size: 10px; color: #0EA5E9; text-decoration: none;'>
+            🎙️ View Gong recording ↗
+          </a>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Earlier touchpoints (collapsed by default to keep sidebar clean)
+    if len(meetings["meetings"]) > 1:
+        with st.expander(f"Earlier touchpoints ({len(meetings['meetings']) - 1})"):
+            for m in meetings["meetings"][1:]:
+                st.markdown(
+                    f"""
+                    <div style='font-size: 11px; padding: 4px 0; border-bottom: 1px solid #F1F5F9;'>
+                      <b>{m['type']}</b> · {m['days_ago']}d ago<br>
+                      <span style='color: #94A3B8;'>{', '.join(m['attendees'])}</span><br>
+                      <a href="{m['gong_link']}" target="_blank"
+                         style='color: #0EA5E9; text-decoration: none;'>🎙️ Recording ↗</a>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
     st.markdown("---")
     phoenix_url = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
