@@ -1,18 +1,21 @@
 """
-Upsell Discovery Agent — Streamlit Web UI
-==========================================
+Northstar — Upsell Discovery Agent (Streamlit Web UI)
+=====================================================
 A live, mobile-responsive interface for the LangGraph agent.
 
 Key features:
 - Account picker with at-a-glance health snapshot
-- Quick-action prompt buttons + free-form chat
+- Quick-action prompts (find opportunity, full motion, compare, co-term, health breakdown)
+- Multi-account compare picker (no more hardcoded comparisons)
+- Fuzzy account name resolution — type "compare Acme and Tyrell" and it just works
 - Live streaming of the agent's reasoning (tool calls + LLM steps)
 - Direct link to Phoenix traces for deep observability
 """
 
 import os
+import re
 import time
-from typing import Iterable
+from typing import Iterable, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -26,8 +29,8 @@ load_dotenv()
 # Page config + styles
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Northstar - Disovery Agent",
-    page_icon="🎯",
+    page_title="Northstar — Upsell Discovery",
+    page_icon="⭐",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -35,10 +38,8 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Tighten up Streamlit's default padding for a more app-like feel */
     .block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1200px; }
 
-    /* Custom badge styling */
     .badge {
         display: inline-block; padding: 2px 10px; border-radius: 12px;
         font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
@@ -48,7 +49,6 @@ st.markdown(
     .badge-bad    { background: #FEE2E2; color: #991B1B; }
     .badge-accent { background: #FFE5DC; color: #C2410C; }
 
-    /* Reasoning step cards */
     .step-card {
         background: #F8FAFC; border-left: 3px solid #FF6B47;
         padding: 12px 16px; margin: 8px 0; border-radius: 4px;
@@ -58,10 +58,8 @@ st.markdown(
     .step-think { border-left-color: #64748B; background: #F1F5F9; }
     .step-final { border-left-color: #10B981; background: #F0FDF4; }
 
-    /* Code-style monospace for tool names */
     .mono { font-family: "SF Mono", Monaco, Consolas, monospace; font-size: 12px; }
 
-    /* Hide Streamlit's default footer and menu for a cleaner look */
     #MainMenu { visibility: hidden; }
     footer { visibility: hidden; }
     </style>
@@ -70,12 +68,17 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# Session state init
+# Session state
 # ---------------------------------------------------------------------------
 if "agent" not in st.session_state:
     st.session_state.agent = None
 if "history" not in st.session_state:
-    st.session_state.history = []  # list of {"query": str, "steps": [...], "final": str}
+    st.session_state.history = []
+if "compare_mode" not in st.session_state:
+    # When user clicks "Compare accounts", we surface a multiselect first
+    st.session_state.compare_mode = False
+if "pending_query" not in st.session_state:
+    st.session_state.pending_query = None
 
 
 def get_agent():
@@ -87,7 +90,101 @@ def get_agent():
 
 
 # ---------------------------------------------------------------------------
-# Helper: health-score badge
+# Fuzzy account-name resolver
+# ---------------------------------------------------------------------------
+# Build a lookup from various name forms → canonical account ID.
+# We support:
+#   - exact account ID (ACME-001)
+#   - full company name ("Acme Corp")
+#   - first-word shorthand ("acme", "tyrell", "pied piper")
+def _build_name_index():
+    index = {}
+    for aid, record in ACCOUNTS.items():
+        name = record["name"]
+        # exact ID
+        index[aid.lower()] = aid
+        # full name
+        index[name.lower()] = aid
+        # first word of name (e.g. "Acme" from "Acme Corp")
+        first_word = name.split()[0].lower()
+        # avoid clobbering — "Wayne" should map to Wayne Enterprises, not get overwritten
+        if first_word not in index:
+            index[first_word] = aid
+        # bare prefix of the ID (e.g. "ACME" from "ACME-001")
+        prefix = aid.split("-")[0].lower()
+        if prefix not in index:
+            index[prefix] = aid
+    return index
+
+
+NAME_INDEX = _build_name_index()
+
+
+def resolve_account_names(text: str) -> str:
+    """Replace company-name mentions in free-form text with their canonical IDs.
+
+    Conservative: we only swap in IDs when the match is unambiguous and the user
+    didn't already use the canonical ID. The original phrasing is preserved by
+    appending the ID in parentheses, so the agent gets both context and the key.
+
+    Example:
+        "compare acme and tyrell" → "compare acme (ACME-001) and tyrell (TYRELL-008)"
+    """
+    if not text:
+        return text
+
+    # Skip if the text already contains an account ID pattern
+    # (we don't want to double-tag things)
+    has_explicit_id = bool(re.search(r"\b[A-Z]+-\d{3}\b", text))
+
+    # Find candidate name mentions, longest-first so "pied piper" wins over "pied"
+    candidates = sorted(NAME_INDEX.keys(), key=len, reverse=True)
+
+    result = text
+    already_inserted_ids = set()
+    if has_explicit_id:
+        # Capture IDs already in the text so we don't re-tag them
+        already_inserted_ids = set(
+            m.upper() for m in re.findall(r"\b[A-Z]+-\d{3}\b", text)
+        )
+
+    for name in candidates:
+        # Skip very-short ambiguous names (1-2 chars) to avoid false positives
+        if len(name) < 3:
+            continue
+        canonical_id = NAME_INDEX[name]
+        if canonical_id in already_inserted_ids:
+            continue
+        # Match whole-word, case-insensitive
+        pattern = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+        if pattern.search(result):
+            # Replace first occurrence only — append the ID in parens
+            def _sub(m, _id=canonical_id):
+                return f"{m.group(0)} ({_id})"
+            new_result, n = pattern.subn(_sub, result, count=1)
+            if n > 0:
+                result = new_result
+                already_inserted_ids.add(canonical_id)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Health-breakdown formatter
+# ---------------------------------------------------------------------------
+def health_breakdown_query(account_id: str) -> str:
+    """Build a query that asks the agent for a comprehensive health readout."""
+    name = ACCOUNTS[account_id]["name"]
+    return (
+        f"Give me a comprehensive account health breakdown for {name} ({account_id}). "
+        f"Cover: 1) headline health summary, 2) usage and adoption signals, "
+        f"3) renewal timing and risk factors, 4) recommended next action. "
+        f"Be thorough — this is for my QBR prep."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Badge helpers
 # ---------------------------------------------------------------------------
 def health_badge(score: int) -> str:
     if score >= 85:
@@ -122,7 +219,6 @@ with st.sidebar:
     acct = ACCOUNTS[account_id]
     usage = USAGE[account_id]
 
-    # Account snapshot card
     st.markdown("---")
     st.markdown(f"#### {acct['name']}")
     st.markdown(
@@ -141,7 +237,6 @@ with st.sidebar:
     st.caption(f"Renewal: **{acct['renewal_date']}**")
     st.caption(f"Industry: {acct['industry']}")
 
-    # Phoenix link
     st.markdown("---")
     phoenix_url = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
     st.markdown(
@@ -164,7 +259,7 @@ with st.sidebar:
 st.markdown(
     """
     <div style='display:flex; align-items:baseline; gap:12px;'>
-      <h1 style='margin:0; font-family: Georgia, serif;'>Northstar 💫</h1>
+      <h1 style='margin:0; font-family: Georgia, serif;'>⭐ Northstar</h1>
       <span class="badge badge-accent">LIVE</span>
     </div>
     <p style='color:#64748B; margin-top:4px;'>
@@ -181,37 +276,87 @@ st.markdown("---")
 # ---------------------------------------------------------------------------
 st.markdown("##### 💡 Quick Plays")
 
-quick_prompts = [
-    f"What's the biggest expansion opportunity in {account_id}?",
-    f"Build a full upsell motion for {account_id} including outreach.",
-    f"Compare expansion potential between ACME-001 and GLOBEX-002.",
-    f"Should I push for a co-term renewal on {account_id}?",
+quick_plays = [
+    ("🎯 Find opportunity", lambda: f"What's the biggest expansion opportunity in {account_id}?"),
+    ("✉️ Full motion + email", lambda: f"Build a full upsell motion for {account_id} including outreach."),
+    ("⚖️ Compare accounts", "compare_picker"),  # special — opens multiselect
+    ("🤝 Co-term play", lambda: f"Should I push for a co-term renewal on {account_id}?"),
+    ("📊 Health breakdown", lambda: health_breakdown_query(account_id)),
 ]
 
-cols = st.columns(len(quick_prompts))
-selected_quick = None
-for i, prompt in enumerate(quick_prompts):
-    label = ["🎯 Find opportunity", "✉️ Full motion + email", "⚖️ Compare accounts", "🤝 Co-term play"][i]
+cols = st.columns(len(quick_plays))
+for i, (label, action) in enumerate(quick_plays):
     if cols[i].button(label, use_container_width=True, key=f"quick_{i}"):
-        selected_quick = prompt
+        if action == "compare_picker":
+            st.session_state.compare_mode = True
+            st.session_state.pending_query = None
+        else:
+            st.session_state.compare_mode = False
+            st.session_state.pending_query = action()
+
+# ---------------------------------------------------------------------------
+# Compare-accounts picker (only shown after the compare button is clicked)
+# ---------------------------------------------------------------------------
+if st.session_state.compare_mode:
+    st.markdown("---")
+    st.markdown("##### ⚖️ Pick accounts to compare")
+    st.caption("Select 2-4 accounts. The agent will analyze each and recommend where to focus.")
+
+    compare_col, button_col = st.columns([3, 1])
+    with compare_col:
+        compare_selection = st.multiselect(
+            "Accounts to compare",
+            options=list(ACCOUNTS.keys()),
+            default=[account_id],  # seed with the currently-selected sidebar account
+            format_func=lambda aid: f"{ACCOUNTS[aid]['name']} ({aid})",
+            max_selections=4,
+            label_visibility="collapsed",
+        )
+    with button_col:
+        run_compare = st.button(
+            "Run comparison",
+            type="primary",
+            use_container_width=True,
+            disabled=len(compare_selection) < 2,
+        )
+        if len(compare_selection) < 2:
+            st.caption("Pick 2+")
+
+    if run_compare and len(compare_selection) >= 2:
+        names = [f"{ACCOUNTS[aid]['name']} ({aid})" for aid in compare_selection]
+        joined = ", ".join(names[:-1]) + f" and {names[-1]}" if len(names) > 1 else names[0]
+        st.session_state.pending_query = (
+            f"Compare expansion potential across these accounts: {joined}. "
+            f"For each, identify the biggest signal and quantify the opportunity. "
+            f"Then recommend which one I should prioritize this week and why."
+        )
+        st.session_state.compare_mode = False  # collapse the picker once submitted
 
 # ---------------------------------------------------------------------------
 # Free-form input
 # ---------------------------------------------------------------------------
-user_query = st.chat_input("Ask the agent anything about your accounts...")
+user_query = st.chat_input("Ask the agent anything — by company name or account ID...")
 
 # Resolve which query to actually run
-query = selected_quick or user_query
+raw_query: Optional[str] = st.session_state.pending_query or user_query
+
+# Apply fuzzy resolution to free-form input only (quick plays already use IDs)
+query: Optional[str] = None
+if raw_query:
+    if user_query and raw_query == user_query:
+        # Free-form text — resolve company names to IDs
+        query = resolve_account_names(raw_query)
+    else:
+        # Quick play or compare picker — already has IDs baked in
+        query = raw_query
+    # Clear the pending query so it doesn't re-run on rerender
+    st.session_state.pending_query = None
 
 # ---------------------------------------------------------------------------
-# Streaming agent execution
+# Agent streaming
 # ---------------------------------------------------------------------------
 def stream_agent_steps(agent, query: str) -> Iterable[dict]:
-    """Yield events as the agent reasons through the problem.
-
-    LangGraph's stream() emits a dict per node execution. We translate those
-    into UI-friendly event dicts.
-    """
+    """Yield events as the agent reasons through the problem."""
     last_message_count = 0
 
     for chunk in agent.stream(
@@ -219,7 +364,6 @@ def stream_agent_steps(agent, query: str) -> Iterable[dict]:
         stream_mode="values",
     ):
         messages = chunk.get("messages", [])
-        # Only process new messages we haven't seen yet
         new_messages = messages[last_message_count:]
         last_message_count = len(messages)
 
@@ -227,7 +371,6 @@ def stream_agent_steps(agent, query: str) -> Iterable[dict]:
             msg_type = type(msg).__name__
 
             if msg_type == "AIMessage":
-                # Either a tool-call decision or a final answer
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
                         yield {
@@ -247,11 +390,15 @@ def stream_agent_steps(agent, query: str) -> Iterable[dict]:
 
 
 if query:
-    # Display the user's question
     with st.chat_message("user"):
-        st.markdown(query)
+        # If we expanded the original input with IDs, show that to the user
+        # so they can see what the agent actually received
+        if user_query and query != user_query:
+            st.markdown(query)
+            st.caption(f"_(resolved from: \"{user_query}\")_")
+        else:
+            st.markdown(query)
 
-    # Stream the agent's work
     with st.chat_message("assistant"):
         steps_container = st.container()
         final_container = st.container()
@@ -318,14 +465,14 @@ if query:
         })
 
 # ---------------------------------------------------------------------------
-# Footer / empty state
+# Empty state
 # ---------------------------------------------------------------------------
-if not st.session_state.history:
+if not st.session_state.history and not st.session_state.compare_mode:
     st.markdown(
         """
         <div style="text-align: center; padding: 40px; color: #94A3B8;">
           <p style="font-size: 15px;">👆 Pick an account from the sidebar, then click a quick play or type a question.</p>
-          <p style="font-size: 13px;">Every run streams its reasoning here and emits a full trace to Phoenix.</p>
+          <p style="font-size: 13px;">You can refer to accounts by company name — "compare Acme and Tyrell" works.</p>
         </div>
         """,
         unsafe_allow_html=True,
